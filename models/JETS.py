@@ -6,13 +6,12 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from typing import List, Tuple, Optional, Dict
 import math
-from mamba_ssm import Mamba
+from mamba_ssm import Mamba2
 import pandas as pd 
 import os 
 from data.config import IMTSConfig
 
     
-
 class TimeEmbedding(nn.Module):
     """Learnable time embedding with sinusoidal positional encoding"""
     
@@ -85,16 +84,51 @@ class TripletEmbedding(nn.Module):
         projected = self.projection(concatenated)  # (batch_size, seq_len, embed_dim)
         
         return self.layer_norm(projected)
-
-
-class MambaEncoder(nn.Module):
-    """Mamba-based encoder"""
     
-    def __init__(self, config: IMTSConfig):
+class BidirectionalMambaLayer(nn.Module):
+    """A single bidirectional Mamba layer."""
+    
+    def __init__(self, d_model: int, d_state: int, d_conv: int, expand: int):
+        super().__init__()
+        self.forward_mamba = Mamba2(d_model, d_state, d_conv, expand)
+        self.backward_mamba = Mamba2(d_model, d_state, d_conv, expand)
+
+    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, embed_dim).
+            padding_mask (torch.Tensor): Boolean tensor where True indicates a padded position.
+        
+        Returns:
+            torch.Tensor: Combined output from forward and backward passes.
+        """
+        # Forward pass
+        out_fwd = self.forward_mamba(x)
+        
+        # Backward pass requires reversing the sequence
+        x_rev = torch.flip(x, dims=[1])
+        out_rev = self.backward_mamba(x_rev)
+        
+        # Un-reverse the output of the backward pass to align with original order
+        out_rev_unflipped = torch.flip(out_rev, dims=[1])
+        
+        # Manually zero out any padded positions in both outputs before combining
+        # This is crucial to prevent "leakage" from padded areas.
+        out_fwd = out_fwd.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+        out_rev_unflipped = out_rev_unflipped.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+
+        # Combine the outputs by adding them
+        return out_fwd + out_rev_unflipped
+    
+class MambaEncoder(nn.Module):
+    """Bidirectional Mamba-based encoder that correctly handles padding."""
+    
+    def __init__(self, config: "IMTSConfig"): # Assuming IMTSConfig is defined elsewhere
         super().__init__()
         self.config = config
+        
         self.layers = nn.ModuleList([
-            Mamba(
+            BidirectionalMambaLayer(
                 d_model=config.embed_dim,
                 d_state=config.mamba_d_state,
                 d_conv=config.mamba_d_conv,
@@ -103,69 +137,25 @@ class MambaEncoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(config.embed_dim)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            x = x + layer(self.norm(x))
-        return self.norm(x)
-
-
-class MaskedTargetPredictor(nn.Module):
-    """Predictor network that takes context and predicts masked targets"""
-    
-    def __init__(self, config: IMTSConfig):
-        super().__init__()
-        self.config = config
-        
-        # Predictor layers
-        self.layers = nn.ModuleList([
-            Mamba(
-                d_model=config.embed_dim,
-                d_state=config.mamba_d_state,
-                d_conv=config.mamba_d_conv,
-                expand=config.mamba_expand,
-            ) for _ in range(config.predictor_layers)
-        ])
-        
-        self.norm = nn.LayerNorm(config.embed_dim)
-        
-        # Linear layer to project concatenated embeddings (time + variable) back to embed_dim
-        self.position_proj = nn.Linear(2 * config.embed_dim, config.embed_dim)
-        
-        # Output projection to predict target representations
-        self.output_proj = nn.Linear(config.embed_dim, config.embed_dim)
-        
-    def forward(self, context_repr: torch.Tensor, target_time_emb: torch.Tensor, 
-                target_var_emb: torch.Tensor, target_count: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            context_repr: Context representations (batch_size, context_len, embed_dim)
-            target_time_emb: Time embeddings for target positions (batch_size, target_len, embed_dim)
-            target_var_emb: Variable embeddings for target positions (batch_size, target_len, embed_dim)
-            target_count: Number of target tokens to predict
-        Returns:
-            predicted_targets: (batch_size, target_len, embed_dim)
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, embed_dim).
+                                Padded positions should already be zeroed out.
+            padding_mask (torch.Tensor): Boolean tensor of shape (batch_size, seq_len)
+                                       where True indicates a padded position.
         """
-        batch_size = context_repr.size(0)
-        
-        # Concatenate time and variable embeddings
-        target_concat = torch.cat([target_time_emb, target_var_emb], dim=-1)  # (batch_size, target_len, 2 * embed_dim)
-        
-        # Project back to embed_dim
-        target_positions = self.position_proj(target_concat)  # (batch_size, target_len, embed_dim)
-        
-        # Concatenate context and target queries -> [batch, seq_len, embed] 
-        x = torch.cat([context_repr, target_positions], dim=1)
-        
-        # Apply predictor layers
         for layer in self.layers:
-            x = x + layer(x)
+            h = self.norm(x)
+            
+            h = layer(h, padding_mask)
+      
+            x = x + h
+            
+        # Apply a final layer norm before returning
+        final_output = self.norm(x)
         
-        x = self.norm(x)
-        
-        # Extract only the target predictions (last target_count tokens)
-        target_predictions = x[:, -int(target_count):]
-        
-        return self.output_proj(target_predictions)
+        return final_output.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
 
 class TransformerEncoder(nn.Module):
@@ -175,64 +165,60 @@ class TransformerEncoder(nn.Module):
         self.config = config
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.embed_dim,
-            nhead=8,  # You may want to make this configurable
+            nhead=4,  
             dim_feedforward=config.embed_dim * 4,
             dropout=0.1,
             activation='gelu',
             batch_first=True
         )
+
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.num_layers)
         self.norm = nn.LayerNorm(config.embed_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
         # x: (batch_size, seq_len, embed_dim)
-        x = self.encoder(x)
+        x = self.encoder(x, src_key_padding_mask=padding_mask)
         return self.norm(x)
-
-class TransformerMaskedTargetPredictor(nn.Module):
-    """Predictor network that takes context and predicts masked targets using Transformer"""
+    
+class MaskedTargetPredictor(nn.Module): 
+    """
+    Predictor network that uses an MLP head. It gets context by adding the 
+    mean-pooled context representation to each target query.
+    """
     def __init__(self, config: IMTSConfig):
         super().__init__()
         self.config = config
-        encoder_layer = nn.TransformerEncoderLayer(
+        
+        # This layer will create the query vector from the target's position
+        self.target_query_proj = nn.Linear(config.embed_dim * 2, config.embed_dim)
+
+        # A standard Transformer decoder layer to perform cross-attention
+        decoder_layer = nn.TransformerDecoderLayer(
             d_model=config.embed_dim,
-            nhead=4,  # You may want to make this configurable
+            nhead=4,
             dim_feedforward=config.embed_dim * 2,
-            dropout=0.1,
-            activation='gelu',
             batch_first=True
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=config.predictor_layers)
-        self.norm = nn.LayerNorm(config.embed_dim)
-        
-        # Linear layer to project concatenated embeddings (time + variable) back to embed_dim
-        self.position_proj = nn.Linear(2 * config.embed_dim, config.embed_dim)
-        
-        self.output_proj = nn.Linear(config.embed_dim, config.embed_dim)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=1) # Just one layer is often enough
 
-    def forward(self, context_repr: torch.Tensor, target_time_emb: torch.Tensor, 
-                target_var_emb: torch.Tensor, target_count: int) -> torch.Tensor:
-        """
-        Args:
-            context_repr: Context representations (batch_size, context_len, embed_dim)
-            target_time_emb: Time embeddings for target positions (batch_size, target_len, embed_dim)
-            target_var_emb: Variable embeddings for target positions (batch_size, target_len, embed_dim)
-            target_count: Number of target tokens to predict
-        Returns:
-            predicted_targets: (batch_size, target_len, embed_dim)
-        """
-        # Concatenate time and variable embeddings
-        target_concat = torch.cat([target_time_emb, target_var_emb], dim=-1)  # (batch_size, target_len, 2 * embed_dim)
+    def forward(self, context_repr: torch.Tensor, context_valid_mask: torch.Tensor, 
+                target_time_emb: torch.Tensor, target_var_emb: torch.Tensor):
         
-        # Project back to embed_dim
-        target_positions = self.position_proj(target_concat)  # (batch_size, target_len, embed_dim)
-        
-        # Concatenate context and target queries -> [batch, seq_len, embed_dim]
-        x = torch.cat([context_repr, target_positions], dim=1)
-        x = self.encoder(x)
-        x = self.norm(x)
-        target_predictions = x[:, -int(target_count):]
-        return self.output_proj(target_predictions)  
+        # Create the queries from the target positions
+        target_pos_info = torch.cat([target_time_emb, target_var_emb], dim=-1)
+        target_queries = self.target_query_proj(target_pos_info)
+
+        #  attend to the context
+        #    - `tgt`: The initial queries (what we want to find).
+        #    - `memory`: The context representation (where to look).
+        #    - `memory_key_padding_mask`: Hides padded parts of the context.
+        predicted_targets = self.decoder(
+            tgt=target_queries,
+            memory=context_repr,
+            memory_key_padding_mask=~context_valid_mask # PyTorch expects True for padded
+        )
+
+        return predicted_targets
     
 class IMTS(nn.Module):
     """
@@ -249,12 +235,11 @@ class IMTS(nn.Module):
 
         # trainable layers 
         self.triplet_embedding = TripletEmbedding(config)
-        # self.context_encoder = MambaEncoder(config)
-        # self.target_encoder = MambaEncoder(config)
-        # self.predictor = MaskedTargetPredictor(config)
-        self.context_encoder = TransformerEncoder(config)
-        self.target_encoder = TransformerEncoder(config)
-        self.predictor = TransformerMaskedTargetPredictor(config)
+        self.context_encoder = MambaEncoder(config)
+        self.target_encoder = MambaEncoder(config)
+        # self.context_encoder = TransformerEncoder(config)
+        # self.target_encoder = TransformerEncoder(config)
+        self.predictor = MaskedTargetPredictor(config)
         # Initialize target encoder frozen
         self._copy_weights(self.context_encoder, self.target_encoder)
         for param in self.target_encoder.parameters():
@@ -264,58 +249,144 @@ class IMTS(nn.Module):
         """Copy weights from source to target."""
         target.load_state_dict(source.state_dict())
     
-    def update_target_encoder(self):
+    def update_target_encoder(self, momentum):
         """Update target encoder using Exponential Moving Average (EMA)."""
         with torch.no_grad():
             for ctx_param, tgt_param in zip(self.context_encoder.parameters(), 
                                           self.target_encoder.parameters()):
-                tgt_param.data.mul_(self.config.ema_momentum).add_(
-                    ctx_param.data, alpha=1.0 - self.config.ema_momentum
+                tgt_param.data.mul_(momentum).add_(
+                    ctx_param.data, alpha=1.0 - momentum
                 )
-    
-    def _create_patch_indices(self, batch_size: int, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _create_forecasting_mask(self, padding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """
-        Creates patch-based indices for context and target tokens for the entire batch.
+        Creates a forecasting-style mask where the last `mask_ratio` portion of
+        non-padded tokens are designated as targets, and the preceding tokens are context.
+        Unlike `_create_patch_indices`, this method is deterministic and masks a
+        contiguous block of tokens at the end of each sequence.
 
         Args:
-            batch_size: The number of samples in the batch.
-            seq_len: The length of the sequences.
-            device: The torch device.
+            padding_mask (torch.Tensor): Mask where True indicates a real token.
 
         Returns:
             A tuple containing:
-            - context_indices (torch.Tensor): Indices of unmasked tokens.
-            - target_indices (torch.Tensor): Indices of masked tokens.
+            - context_indices (torch.Tensor): Padded tensor of context indices.
+            - target_indices (torch.Tensor): Padded tensor of target indices.
+            - num_masked (int): The max number of target tokens in a batch.
         """
-        patch_size = getattr(self.config, 'patch_size', 1)
-        num_patches = seq_len // patch_size
-
-        # Generate random permutation of patch indices for the whole batch
-        patch_indices = torch.argsort(torch.rand(batch_size, num_patches, device=device), dim=-1)
-
-        # Determine how many patches to mask
-        num_masked_patches = int(self.config.mask_ratio * num_patches)
-        num_context_patches = num_patches - num_masked_patches
-
-        context_patch_indices = torch.sort(patch_indices[:, num_masked_patches:], dim=-1).values
-        target_patch_indices = torch.sort(patch_indices[:, :num_masked_patches], dim=-1).values
-
-    
-        patch_range = torch.arange(patch_size, device=device)
-
+        batch_size = padding_mask.shape[0]
+        device = padding_mask.device
         
-        context_indices = context_patch_indices.unsqueeze(-1) * patch_size + patch_range
-        target_indices = target_patch_indices.unsqueeze(-1) * patch_size + patch_range
+        all_context_indices = []
+        all_target_indices = []
 
-        context_indices = context_indices.flatten(start_dim=1)
-        target_indices = target_indices.flatten(start_dim=1)
+        for i in range(batch_size):
+            # Find indices of non-padded tokens for the current sequence
+            real_token_indices = padding_mask[i].nonzero(as_tuple=True)[0]
+            num_real_tokens = len(real_token_indices)
 
-        remaining_tokens = seq_len % patch_size
-        if remaining_tokens > 0:
-            remainder_start = num_patches * patch_size
-            remainder_indices = torch.arange(remainder_start, seq_len, device=device).expand(batch_size, -1)
-            context_indices = torch.cat([context_indices, remainder_indices], dim=1)
-        num_masked = num_masked_patches * patch_size
+            # If there are not enough tokens to create a context and target,
+            # assign all to context and none to target.
+            if num_real_tokens < 2:
+                all_context_indices.append(real_token_indices)
+                all_target_indices.append(torch.tensor([], device=device, dtype=torch.long))
+                continue
+
+            # Calculate the number of tokens to mask (target)
+            num_masked_tokens = int(self.config.mask_ratio * num_real_tokens)
+            
+            # Ensure at least one token is kept for context
+            if num_masked_tokens >= num_real_tokens:
+                num_masked_tokens = num_real_tokens - 1
+
+            # Determine the split point
+            split_idx = num_real_tokens - num_masked_tokens
+            
+            # Split the real_token_indices into context and target
+            ctx_indices_sample = real_token_indices[:split_idx]
+            tgt_indices_sample = real_token_indices[split_idx:]
+            
+            all_context_indices.append(ctx_indices_sample)
+            all_target_indices.append(tgt_indices_sample)
+
+        # Pad index lists to create rectangular tensors for batch processing
+        context_indices = torch.nn.utils.rnn.pad_sequence(
+            all_context_indices, batch_first=True, padding_value=-1
+        )
+        target_indices = torch.nn.utils.rnn.pad_sequence(
+            all_target_indices, batch_first=True, padding_value=-1
+        )
+        
+        num_masked = target_indices.shape[1]
+
+        return context_indices, target_indices, num_masked
+    
+    def _create_patch_indices(self, padding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """
+        Creates patches by evenly dividing the non-padded tokens for each sequence.
+        This function iterates over the batch dimension because the number of real
+        tokens is variable, making full vectorization impractical. This loop-and-pad
+        pattern is standard and efficient for handling such ragged data.
+
+        Args:
+            padding_mask (torch.Tensor): Mask where True indicates a real token.
+
+        Returns:
+            A tuple containing:
+            - context_indices (torch.Tensor): Padded tensor of context indices.
+            - target_indices (torch.Tensor): Padded tensor of target indices.
+            - num_masked (int): The max number of target tokens in a batch.
+        """
+        batch_size = padding_mask.shape[0]
+        device = padding_mask.device
+        
+        all_context_indices = []
+        all_target_indices = []
+
+        for i in range(batch_size):
+            # Find indices of non-padded tokens for the current sequence
+            real_token_indices = padding_mask[i].nonzero(as_tuple=True)[0]
+            num_real_tokens = len(real_token_indices)
+
+            # If no real tokens, skip
+            if num_real_tokens == 0:
+                all_context_indices.append(torch.tensor([], device=device, dtype=torch.long))
+                all_target_indices.append(torch.tensor([], device=device, dtype=torch.long))
+                continue
+
+            # Cannot have more patches than tokens.
+            num_patches_for_sample = min(num_real_tokens, self.config.num_patches)
+            
+            # Create evenly spaced patches over the real tokens.
+            patch_boundaries = torch.linspace(0, num_real_tokens, num_patches_for_sample + 1, device=device).long()
+
+            # Shuffle patch IDs and select ones to mask
+            shuffled_patch_ids = torch.randperm(num_patches_for_sample, device=device)
+            num_masked_patches = int(self.config.mask_ratio * num_patches_for_sample)
+            masked_patch_ids = shuffled_patch_ids[:num_masked_patches]
+            
+            # Collect original sequence 
+            ctx_indices_sample, tgt_indices_sample = [], []
+            for patch_id in range(num_patches_for_sample):
+                start, end = patch_boundaries[patch_id], patch_boundaries[patch_id+1]
+                patch_original_indices = real_token_indices[start:end]
+                
+                if patch_id in masked_patch_ids:
+                    tgt_indices_sample.append(patch_original_indices)
+                else:
+                    ctx_indices_sample.append(patch_original_indices)
+
+            all_context_indices.append(torch.cat(ctx_indices_sample) if ctx_indices_sample else torch.tensor([], device=device, dtype=torch.long))
+            all_target_indices.append(torch.cat(tgt_indices_sample) if tgt_indices_sample else torch.tensor([], device=device, dtype=torch.long))
+
+        # Pad index lists to create rectangular tensors for batch processing
+        context_indices = torch.nn.utils.rnn.pad_sequence(
+            all_context_indices, batch_first=True, padding_value=-1
+        )
+        target_indices = torch.nn.utils.rnn.pad_sequence(
+            all_target_indices, batch_first=True, padding_value=-1
+        )
+        
+        num_masked = target_indices.shape[1]
 
         return context_indices, target_indices, num_masked
     
@@ -326,68 +397,72 @@ class IMTS(nn.Module):
             padding_mask: (batch_size, seq_len) - True for real tokens, False for padding.
             return_representations: If True, return full sequence representations for downstream tasks.
         """
+       
         batch_size, seq_len, _ = triplets.shape
-        device = triplets.device
-        
         embeddings = self.triplet_embedding(triplets)
+        
         if return_representations:
-            # For downstream tasks, use the context encoder on the full sequence
-            return {'representations': self.context_encoder(embeddings)}
+            # For downstream tasks, zero out padding and pass the correct attention mask
+            embeddings = embeddings * padding_mask.unsqueeze(-1).float()
+            return {'representations': self.context_encoder(embeddings, padding_mask=~padding_mask)}
         
-        context_indices, target_indices, num_masked = self._create_patch_indices(batch_size, seq_len, device)
+        # Create context/target indices based on dynamic patching
+        context_indices, target_indices, num_masked = self._create_patch_indices(padding_mask)
         
-        # Handle potential padding in indices (where -1 indicates padding)
-        context_valid_mask = context_indices != -1
-        target_valid_mask = target_indices != -1
+        # Create masks from padded indices (-1 indicates padding)
+        context_valid_mask = (context_indices != -1)
+        target_valid_mask = (target_indices != -1)
         
-        # Clamp indices to valid range to avoid indexing errors
-        context_indices_clamped = torch.clamp(context_indices, 0, seq_len - 1)
-        target_indices_clamped = torch.clamp(target_indices, 0, seq_len - 1)
+        # Clamp indices to valid range for gathering, zero out padded positions later
+        context_indices_clamped = context_indices.masked_fill(~context_valid_mask, 0)
+        target_indices_clamped = target_indices.masked_fill(~target_valid_mask, 0)
         
-        # Gather embeddings
+        # Process context encoder
         context_indices_emb = context_indices_clamped.unsqueeze(-1).expand(-1, -1, embeddings.shape[-1])
         context_emb = torch.gather(embeddings, 1, context_indices_emb)
+        context_emb = context_emb * context_valid_mask.unsqueeze(-1).float() # Zero out padded embeddings
+        context_repr = self.context_encoder(context_emb, padding_mask=~context_valid_mask) # 1 for padded
         
-        # Apply valid mask to context embeddings
-        context_emb = context_emb * context_valid_mask.unsqueeze(-1).float()
-        
-        context_repr = self.context_encoder(context_emb)
-        
-        # Get the target representation for the full timeseries and keep the masked tokens for loss computation
+        # Process target encoder
         with torch.no_grad():
-            full_sequence_repr = self.target_encoder(embeddings)
+            embeddings_for_target = embeddings * padding_mask.unsqueeze(-1).float()
+            full_sequence_repr = self.target_encoder(embeddings_for_target, padding_mask=~padding_mask)
+            
             target_indices_repr = target_indices_clamped.unsqueeze(-1).expand(-1, -1, full_sequence_repr.shape[-1])
             target_repr = torch.gather(full_sequence_repr, 1, target_indices_repr)
+            target_repr = target_repr * target_valid_mask.unsqueeze(-1).float() # Zero out padded targets
 
-        # Get the positional information for the masked target positions
+        # Prepare inputs for the predictor
         target_times = torch.gather(triplets[:, :, 0], 1, target_indices_clamped)
         target_variables = torch.gather(triplets[:, :, 1], 1, target_indices_clamped).long()
         
-        # Get embeddings for target positions
         target_time_emb = self.triplet_embedding.time_embedding(target_times.flatten()).view(target_times.shape[0], target_times.shape[1], -1)
         target_var_emb = self.triplet_embedding.variable_embedding(target_variables)
         
-        # Predict the masked tokens using the context and target positions
+        # Zero out positional embeddings for padded targets
+        target_time_emb = target_time_emb * target_valid_mask.unsqueeze(-1).float()
+        target_var_emb = target_var_emb * target_valid_mask.unsqueeze(-1).float()
+
+
+        # Handle case with no target tokens
+        if num_masked == 0:
+            return {'loss': torch.tensor(0.0, device=embeddings.device, requires_grad=True)}
+
         predicted_targets = self.predictor(
             context_repr, 
+            context_valid_mask,
             target_time_emb,
             target_var_emb,
-            num_masked
         )
 
-        # target_mask will have shape (batch_size, num_masked_tokens)
-        target_padding_mask = torch.gather(padding_mask, 1, target_indices_clamped)
-        target_mask = target_padding_mask * target_valid_mask
+        loss_per_token = (predicted_targets - target_repr)**2
+        loss_per_token = loss_per_token.mean(dim=-1) 
 
-        squared_error = (predicted_targets - target_repr.detach())**2
-        masked_squared_error = squared_error * target_mask.unsqueeze(-1)
-        
-        # average the loss over all masked tokens (non-padded)
-        sum_loss = masked_squared_error.sum()
-        num_real_elements = target_mask.sum() * self.config.embed_dim
-        
-        # Compute the final mean loss with eps
-        loss = sum_loss / (num_real_elements + 1e-8)
-        
+        # Apply mask and compute mean loss over valid (non-padded) tokens
+        masked_loss = loss_per_token * target_valid_mask.float()
+        sum_loss = masked_loss.sum()
+        num_real_elements = target_valid_mask.sum()
+        loss = sum_loss / (num_real_elements + 1e-8) 
+
         return {'loss': loss}
     

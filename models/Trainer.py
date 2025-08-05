@@ -11,27 +11,54 @@ from models.JETS import IMTS
 from data.dataset import collate_triplets, EmpiricalDatasetIMTS
 
 class IMTSTrainer:
-    """Trainer for IMTS model with mixed precision support"""
+    """Trainer for IMTS model with mixed precision support and gradient accumulation"""
     
     def __init__(self, model: IMTS, config: IMTSConfig, use_amp: bool = True):
         self.model = model
         self.config = config
         self.use_amp = use_amp and torch.cuda.is_available()  # Only use AMP if CUDA is available
-        
+        self.global_step = 0
         self.optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad], 
             lr=config.learning_rate, 
-            weight_decay=1e-5
+            weight_decay=1e-4
         )
         
         print("Number of trainable parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
         print("Training with patch size: ", config.patch_size)
+        print(f"Learning rate: {config.learning_rate:.2e}")
+        print(f"Batch size: {config.batch_size}")
         
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, 
-            T_max=config.num_epochs, 
-            eta_min=0.001 * config.learning_rate
-        )
+        total_training_steps = config.num_epochs * config.epoch_total_steps
+        total_warmup_steps = config.warmup_epochs * config.epoch_total_steps
+        
+        def lr_lambda(current_step: int):
+            """
+            Defines the LR multiplier based on the current training step.
+            - Phase 1: Linear warmup over `total_warmup_steps`.
+            - Phase 2: Cosine decay over the remaining steps.
+            """
+            # 1. Linear warmup phase
+            if current_step < total_warmup_steps:
+                return float(current_step) / float(max(1, total_warmup_steps))
+            
+            # 2. Cosine decay phase
+            else:
+                eta_min_ratio = 0.001
+                
+                # Calculate progress in the decay phase
+                decay_progress = float(current_step - total_warmup_steps)
+                decay_duration = float(total_training_steps - total_warmup_steps)
+
+                # Cosine decay formula
+                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * decay_progress / max(1, decay_duration)))
+                
+                # Final multiplier in the decay phase
+                return eta_min_ratio + (1.0 - eta_min_ratio) * cosine_decay
+        
+        # Create the LambdaLR scheduler based on steps
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+        
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Training on device: {self.device}")
@@ -51,11 +78,13 @@ class IMTSTrainer:
         self.model.train()
         total_loss = 0
         num_batches = 0
+        total_steps = self.config.num_epochs * self.condig.epoch_total_steps
         
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
             triplets = batch[0].to(self.device, non_blocking=True)
             mask = batch[1].to(self.device, non_blocking=True)
             
+            # Zero gradients for each batch
             self.optimizer.zero_grad()
             
             if self.use_amp:
@@ -74,14 +103,6 @@ class IMTSTrainer:
                 # Backward pass with gradient scaling
                 self.scaler.scale(loss).backward()
                 
-                # Gradient clipping with scaler
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                
-                # Optimizer step with scaler
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                
             else:
                 # Standard training without mixed precision
                 outputs = self.model(triplets, mask)
@@ -94,22 +115,48 @@ class IMTSTrainer:
                     sys.exit(1)
                 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
             
-            # Update target encoder
-            self.model.update_target_encoder()
+            # Calculate batch variance for monitoring
+            with torch.no_grad():
+                # Get embeddings for variance calculation
+                embeddings = self.model.triplet_embedding(triplets)
+                # Apply padding mask
+                masked_embeddings = embeddings * mask.unsqueeze(-1).float()
+                # Calculate variance across the batch (excluding padding)
+                batch_variance = torch.var(masked_embeddings, dim=0).mean().item()
+                batch_mean = torch.mean(masked_embeddings).item()
             
-            # Log metrics
+            # Log metrics for each batch
             wandb.log({
                 "train_loss": loss.item(), 
-                "lr": self.scheduler.get_last_lr()[0]
+                "lr": self.scheduler.get_last_lr()[0],
+                "batch_variance": batch_variance,
+                "batch_mean": batch_mean
             })
             
             total_loss += loss.item()
             num_batches += 1
+            
+            # Perform optimizer step and gradient clipping
+            if self.use_amp:
+                # Gradient clipping with scaler
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                
+                # Optimizer step with scaler
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                # Standard gradient clipping and optimizer step
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                
+            self.scheduler.step()
+            # Update target encoder every batch
+            current_momentum = self.config.ema_momentum + (1.0 - self.config.ema_momentum) * (self.global_step / total_training_steps)
+            self.global_step += 1
+            self.model.update_target_encoder(current_momentum)
         
-        self.scheduler.step()
         return total_loss / num_batches
     
     def train_MAE_epoch(self, dataloader: DataLoader) -> float:
@@ -223,7 +270,6 @@ class IMTSTrainer:
                 representations.append(pooled)
         
         return torch.cat(representations, dim=0)
-
 
 # Updated main training loop
 if __name__ == "__main__":

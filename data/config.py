@@ -15,9 +15,10 @@ class IMTSConfig:
     mask_ratio: float = 0.7 # the original masked autoencoder uses larger ratios, need to tune this 
     num_masked_tokens: int = mask_ratio * max_seq_len
     num_epochs: int = 50
+    batch_size: int = 32
+    epoch_total_steps: int = 14400 // batch_size
     min_seq_len: int = 100
     learning_rate: float = 1e-5
-    batch_size: int = 32
     timeseries_columns = [# Heart Rate
                 'heartRate_avg',
                 'heartRate_stdDev',
