@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import math
 from typing import Tuple, Dict
 from JETS import *
 import pandas as pd
@@ -8,7 +7,7 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 from data.config import IMTSConfig
 from data.dataset import collate_triplets, EmpiricalDatasetIMTS
 import wandb
-from models.Trainer import IMTSTrainer
+from trainer import IMTSTrainer
 
 
 class MAEDecoder(nn.Module):
