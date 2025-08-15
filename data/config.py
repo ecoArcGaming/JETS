@@ -11,7 +11,6 @@ class IMTSConfig:
     num_layers: int = 8
     predictor_layers: int = 2
     max_seq_len: int = 5000  # 1000
-    num_variables: int = 63
     ema_momentum: float = 0.998
     mask_ratio: float = (
         0.7  # the original masked autoencoder uses larger ratios, need to tune this
@@ -99,6 +98,8 @@ class IMTSConfig:
         "numHoursDataCoverage",
         "eventSummary_overallScore",
     ]
+    num_variables: int = len(timeseries_columns)
+
     target_columns = [
         "ADHD or ADD",
         "Anxiety",
