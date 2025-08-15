@@ -22,6 +22,7 @@ class IMTSConfig:
     epoch_total_steps: int = 14400 // batch_size # should be the number of entries in a dataloder 
     min_seq_len: int = 100
     learning_rate: float = 1e-5
+    patch_size: int = 32 # for MAE
     timeseries_columns = [  # Heart Rate
         "heartRate_avg",
         "heartRate_stdDev",
@@ -121,3 +122,4 @@ class IMTSConfig:
     pretrain: int = 1 # set to 0 for finetuning/eval
     save_dir: str = "checkpoints" # folder to save checkpoints
     load_ckpt_path: str = "checkpoints/model_best.pt" # path to load checkpoint from 
+

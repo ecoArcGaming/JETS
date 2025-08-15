@@ -147,53 +147,6 @@ class MaskedAutoencoder(nn.Module):
         return {"loss": loss}
 
 
-class GRU(nn.Module):
-    """
-    A simple supervised baseline using a GRU for variable-length time series classification.
-    """
-
-    def __init__(self, config: IMTSConfig, gru_hidden_dim: int, gru_layers: int = 2):
-        super().__init__()
-
-        self.triplet_embedding = TripletEmbedding(config)
-
-        self.gru = nn.GRU(
-            input_size=config.embed_dim,
-            hidden_size=gru_hidden_dim,
-            num_layers=gru_layers,
-            batch_first=True,
-            bidirectional=False,  # Keep it simple for a baseline
-        )
-
-        self.classifier = nn.Linear(gru_hidden_dim, 1)
-
-    def forward(self, triplets: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            triplets (torch.Tensor): Padded tensor of shape (batch_size, max_seq_len, 3).
-            lengths (torch.Tensor): Tensor of original sequence lengths, shape (batch_size,).
-
-        Returns:
-            torch.Tensor: Logits for binary classification, shape (batch_size, 1).
-        """
-        # 1. Get embeddings
-        # -> (batch_size, max_seq_len, embed_dim)
-        embeddings = self.triplet_embedding(triplets)
-
-        # 2. Pack the padded sequence
-        # This tells the GRU to ignore the padded parts of the sequences.
-        # We enforce cpu for pack_padded_sequence lengths arg as it's a requirement.
-        packed_embeddings = pack_padded_sequence(
-            embeddings, lengths.cpu(), batch_first=True, enforce_sorted=False
-        )
-
-        _, last_hidden = self.gru(packed_embeddings)
-
-        final_representation = last_hidden[-1]
-        logits = self.classifier(final_representation)
-
-        return logits
-
 
 if __name__ == "__main__":
 
@@ -250,7 +203,7 @@ if __name__ == "__main__":
 
     best_val_loss = float("inf")
     for epoch in range(args.num_epochs):
-        train_loss = trainer.train_epoch(train_loader)
+        train_loss = trainer.train_MAE_epoch(train_loader)
         val_loss = trainer.validate_epoch(val_loader)
 
         print(
@@ -261,9 +214,9 @@ if __name__ == "__main__":
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             os.makedirs(args.save_dir, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(args.save_dir, "model_best.pt"))
+            torch.save(model.state_dict(), os.path.join(args.save_dir, "MAE_model_best.pt"))
             print(
-                f"New best model weights saved to {args.save_dir}/model_best.pt (val_loss={val_loss:.6f})"
+                f"New best model weights saved to {args.save_dir}/MAE_model_best.pt (val_loss={val_loss:.6f})"
             )
 
     print("Training complete!")
