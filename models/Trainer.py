@@ -20,7 +20,7 @@ class IMTSTrainer:
         self.config = config
         self.use_amp = (
             use_amp and torch.cuda.is_available()
-        )  # Only use AMP if CUDA is available
+        )  # Only use AMP if CUDA is available, choose this for mixed precision training 
         self.global_step = 0
         self.optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
@@ -45,33 +45,30 @@ class IMTSTrainer:
             - Phase 1: Linear warmup over `total_warmup_steps`.
             - Phase 2: Cosine decay over the remaining steps.
             """
-            # 1. Linear warmup phase
+            # Linear warmup phase
             if current_step < total_warmup_steps:
                 return float(current_step) / float(max(1, total_warmup_steps))
 
-            # 2. Cosine decay phase
+            # Cosine decay phase
             else:
                 eta_min_ratio = 0.001
 
-                # Calculate progress in the decay phase
                 decay_progress = float(current_step - total_warmup_steps)
                 decay_duration = float(total_training_steps - total_warmup_steps)
 
-                # Cosine decay formula
                 cosine_decay = 0.5 * (
                     1.0 + math.cos(math.pi * decay_progress / max(1, decay_duration))
                 )
 
-                # Final multiplier in the decay phase
                 return eta_min_ratio + (1.0 - eta_min_ratio) * cosine_decay
 
-        # Create the LambdaLR scheduler based on steps
+        # LambdaLR scheduler based on steps
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Training on device: {self.device}")
 
-        # Initialize GradScaler for mixed precision
+        # GradScaler for mixed precision
         if self.use_amp:
             self.scaler = GradScaler()
             print("Mixed precision training enabled")
@@ -92,7 +89,7 @@ class IMTSTrainer:
             triplets = batch[0].to(self.device, non_blocking=True)
             mask = batch[1].to(self.device, non_blocking=True)
 
-            # Zero gradients for each batch
+            # Zero gradients
             self.optimizer.zero_grad()
 
             if self.use_amp:

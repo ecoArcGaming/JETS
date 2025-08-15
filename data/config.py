@@ -9,7 +9,7 @@ class IMTSConfig:
     mamba_d_conv: int = 4
     mamba_expand: int = 2
     num_layers: int = 8
-    predictor_layers: int = 4
+    predictor_layers: int = 2
     max_seq_len: int = 5000  # 1000
     num_variables: int = 63
     ema_momentum: float = 0.998
@@ -19,7 +19,7 @@ class IMTSConfig:
     num_masked_tokens: int = mask_ratio * max_seq_len
     num_epochs: int = 50
     batch_size: int = 32
-    epoch_total_steps: int = 14400 // batch_size
+    epoch_total_steps: int = 14400 // batch_size # should be the number of entries in a dataloder 
     min_seq_len: int = 100
     learning_rate: float = 1e-5
     timeseries_columns = [  # Heart Rate
@@ -98,75 +98,26 @@ class IMTSConfig:
         "numHoursDataCoverage",
         "eventSummary_overallScore",
     ]
-    binary_columns = [
+    target_columns = [
         "ADHD or ADD",
-        "Alzheimer's",
         "Anxiety",
-        "Arthritis",
         "Asthma",
-        "Atrial fibrillation",
         "Atrial flutter",
         "Autism spectrum disorders",
-        "Back pain",
-        "Bipolar",
-        "Brain cancer",
-        "Breast cancer",
-        "COPD",
         "COPD (chronic obstructive pulmonary disease)",
-        "Chronic kidney disease",
         "Circadian rhythm disorders",
-        "Colon cancer",
         "Depression",
-        "Diabetes",
-        "Endometrial cancer",
-        "Fatty liver disease",
-        "HIV/AIDS",
-        "Heart failure",
-        "Hepatitis",
-        "High cholesterol",
         "Hypertension",
-        "Hypertension (high blood pressure)",
-        "Insomnia",
-        "Kidney cancer",
-        "Leukemia (cancer)",
-        "Liver cancer",
         "Long covid",
-        "Lung cancer",
         "ME/CFS",
-        "Melanoma (skin cancer)",
         "Myocarditis",
         "Osteoporosis",
-        "Other",
-        "Other cancer",
-        "Other heart conditions",
-        "Other lung disease",
-        "Other medical conditions",
-        "Other mental health conditions",
-        "Other skin cancers",
-        "Other sleep conditions",
-        "POTS",
         "POTS (postural orthostatic tachycardia syndrome)",
-        "Pancreatic cancer",
-        "Parkinson's",
-        "Previous stroke",
-        "Prostate cancer",
-        "Pulmonary fibrosis",
-        "Restless leg syndrome",
-        "SVT",
-        "SVT (Supraventricular tachycardia)",
-        "Schizophrenia",
         "Sick Sinus Syndrome",
-        "Sleep apnea",
         "Substance abuse",
-        "Thyroid cancer",
-        "Ventricular Arrhythmias",
-        "WPW (Wolff-Parkinson-White Syndrome)",
-        "other medical conditions",
     ]
-    target_column: str = "Diabetes"
     data_path: str = "dhs.parquet"
-    binary_data_path: str = "dx.parquet"
-    pretrain: int = 1
-    save_dir: str = "checkpoints"
-    load_ckpt_path: str = "checkpoints/model_best.pt"
-    patch_size = 16
+    binary_data_path: str = "dx.parquet" # also works for biomarker (continous) data
+    pretrain: int = 1 # set to 0 for finetuning/eval
+    save_dir: str = "checkpoints" # folder to save checkpoints
+    load_ckpt_path: str = "checkpoints/model_best.pt" # path to load checkpoint from 

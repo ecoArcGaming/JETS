@@ -1,4 +1,12 @@
 from probe_diagnosis import * 
+from data.config import IMTSConfig
+from matplotlib import pyplot as plt
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+import torch
+import pandas as pd
+from typing import Optional, List, Tuple
 
 def visualize_embeddings_tsne_multi_target(
     embedding_loader, 
@@ -199,7 +207,6 @@ def create_label_combination_plot(embeddings_2d, labels_array, target_names, fig
 if __name__ == "__main__":
 
     args = IMTSConfig()
-    args.pretrain = 0
     ckpt = torch.load(args.load_ckpt_path)
     model = IMTS(args)
     model.load_state_dict(ckpt)
@@ -208,51 +215,10 @@ if __name__ == "__main__":
     df = pd.read_parquet(args.data_path)
     binary_df = pd.read_parquet(args.binary_data_path)
 
-    all_targets = ['ADHD or ADD', 
-                "Alzheimer's", 
-                'Anxiety', 
-                'Arthritis', 
-                'Asthma', 
-                'Atrial fibrillation', 
-                'Atrial flutter', 
-                'Autism spectrum disorders', 
-                'Back pain', 'Bipolar', 
-                'COPD (chronic obstructive pulmonary disease)', 
-                'Chronic kidney disease', 
-                'Circadian rhythm disorders', 
-                'Depression', 
-                'Diabetes', 
-                'Fatty liver disease', 
-                'HIV/AIDS', 
-                'Heart failure', 
-                'Hepatitis', 
-                'High cholesterol', 
-                'Hypertension', 
-                'Insomnia', 
-                'Long covid', 
-                'ME/CFS', 
-                'Myocarditis', 
-                'Osteoporosis', 
-                'POTS (postural orthostatic tachycardia syndrome)', 
-                "Parkinson's", 
-                'Previous stroke', 
-                'Pulmonary fibrosis', 
-                'Restless leg syndrome', 
-                'SVT (Supraventricular tachycardia)', 
-                'Schizophrenia', 
-                'Sick Sinus Syndrome', 
-                'Sleep apnea', 
-                'Substance abuse', 
-                'Ventricular Arrhythmias', 
-                'WPW (Wolff-Parkinson-White Syndrome)', 
-                ]
+    all_targets = args.target_columns
 
     # Filter targets that actually exist in binary_df
     available_targets = [target for target in all_targets if target in binary_df.columns]
-    missing_targets = [target for target in all_targets if target not in binary_df.columns]
-
-    if missing_targets:
-        print(f"⚠️  Warning: The following targets are not available in binary_df: {missing_targets}")
 
     print(f"📊 Evaluating {len(available_targets)} available target conditions simultaneously...")
     print("Available targets:", available_targets[:5], "..." if len(available_targets) > 5 else "")

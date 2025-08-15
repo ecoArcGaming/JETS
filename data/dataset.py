@@ -6,7 +6,6 @@ import pandas as pd
 import pickle
 import gc
 
-
 class EmpiricalDatasetIMTS(Dataset):
     """
     Dataset for IMTS model that outputs triplets (time, variable_id, value).
@@ -695,78 +694,3 @@ def collate_triplets(batch):
     else:
         return triplets_tensor, padding_mask
 
-
-def collate_triplets_forecast(batch, forecast_percent=0.7):
-    """
-    Custom collate function for IMTS triplets with forecasting.
-    Masks portion of sequence for forecasting task.
-    """
-    if isinstance(batch[0], tuple):
-        # Finetuning case: (triplets, labels)
-        triplets, labels = zip(*batch)
-        labels = torch.stack(labels)
-    else:
-        # Pretraining case: just triplets
-        triplets = batch
-        labels = None
-
-    # Find max sequence length in batch
-    max_len = max(len(seq) for seq in triplets)
-
-    # Pad sequences and create masks
-    padded_triplets = []
-    padding_masks = []
-    forecast_values = []
-    forecast_masks = []
-
-    for seq in triplets:
-        seq_len = len(seq)
-        seq_tensor = torch.FloatTensor(seq)
-
-        # Calculate forecast length
-        forecast_len = int(seq_len * forecast_percent)
-        forecast_start = seq_len - forecast_len if forecast_len > 0 else seq_len
-
-        # Create masks
-        mask = torch.ones(seq_len, dtype=torch.bool)
-        forecast_mask = torch.zeros(seq_len, dtype=torch.bool)
-        if forecast_len > 0:
-            forecast_mask[forecast_start:] = True
-
-        # Extract forecast values before masking
-        forecast_vals = seq_tensor.clone()
-
-        # Mask forecast portion in input
-        if forecast_len > 0:
-            seq_tensor[forecast_start:] = 0
-
-        if seq_len < max_len:
-            # Pad with zeros
-            padding = torch.zeros(max_len - seq_len, 3)
-            seq_tensor = torch.cat([seq_tensor, padding], dim=0)
-            forecast_vals = torch.cat([forecast_vals, padding], dim=0)
-
-            # Extend masks
-            padding_mask = torch.zeros(max_len - seq_len, dtype=torch.bool)
-            mask = torch.cat([mask, padding_mask], dim=0)
-
-            forecast_padding = torch.zeros(max_len - seq_len, dtype=torch.bool)
-            forecast_mask = torch.cat([forecast_mask, forecast_padding], dim=0)
-
-        padded_triplets.append(seq_tensor)
-        padding_masks.append(mask)
-        forecast_values.append(forecast_vals)
-        forecast_masks.append(forecast_mask)
-
-    triplets_tensor = torch.stack(padded_triplets)
-    padding_mask = torch.stack(padding_masks)
-    forecast_values_tensor = torch.stack(forecast_values)
-    forecast_mask_tensor = torch.stack(forecast_masks)
-
-    # Combine padding and forecast masks
-    combined_forecast_mask = forecast_mask_tensor & padding_mask
-
-    if labels is not None:
-        return triplets_tensor, forecast_values_tensor, combined_forecast_mask, labels
-    else:
-        return triplets_tensor, forecast_values_tensor, combined_forecast_mask

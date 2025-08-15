@@ -1,121 +1,108 @@
-from Mamba6 import *
-from sklearn.metrics import r2_score, mean_absolute_error
-import torch
-from tqdm import tqdm
-import torch
-from torch.utils.data import TensorDataset, DataLoader
-import pandas as pd
-import numpy as np
 import os
 from datetime import datetime
-from torch.utils.data import SubsetRandomSampler
-from models.MAE import MaskedAutoencoder
-from data.dataset import collate_triplets, EmpiricalDatasetIMTS
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.metrics import mean_absolute_error
+from torch.utils.data import DataLoader, SubsetRandomSampler, TensorDataset
+from tqdm import tqdm
+from MAE import MaskedAutoencoder
+from JETS import *
 from data.config import IMTSConfig
+from data.dataset import collate_triplets, EmpiricalDatasetIMTS
 
 
-def convert_long_to_wide_targets(
-    df, user_column="user", target_column="target_name", value_column="value"
+class LabelNormalizer:
+    """Handles normalization and denormalization of labels for multiple targets."""
+
+    def __init__(self):
+        self.means = {}
+        self.stds = {}
+        self.fitted = False
+
+    def fit(self, labels, target_names):
+        """
+        Fit the normalizer on training labels.
+
+        Args:
+            labels: torch.Tensor of shape [N, num_targets] or [N] for single target.
+            target_names: List of target names.
+        """
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(-1)
+
+        self.means = {}
+        self.stds = {}
+
+        for i, target_name in enumerate(target_names):
+            target_labels = labels[:, i]
+            valid_mask = ~torch.isnan(target_labels)
+
+            if valid_mask.any():
+                valid_labels = target_labels[valid_mask]
+                self.means[target_name] = valid_labels.mean().item()
+                self.stds[target_name] = valid_labels.std().item()
+
+                # Prevent division by zero for constant targets
+                if self.stds[target_name] == 0:
+                    self.stds[target_name] = 1.0
+            else:
+                self.means[target_name] = 0.0
+                self.stds[target_name] = 1.0
+
+        self.fitted = True
+        print("Label normalization parameters:")
+        for target_name in target_names:
+            print(
+                f"  {target_name}: mean={self.means[target_name]:.4f}, "
+                f"std={self.stds[target_name]:.4f}"
+            )
+
+    def normalize(self, labels, target_names):
+        """Normalize labels using fitted parameters."""
+        if not self.fitted:
+            raise ValueError("Normalizer must be fitted before use")
+
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(-1)
+
+        normalized = labels.clone()
+        for i, target_name in enumerate(target_names):
+            target_labels = labels[:, i]
+            valid_mask = ~torch.isnan(target_labels)
+
+            if valid_mask.any():
+                normalized[valid_mask, i] = (
+                    target_labels[valid_mask] - self.means[target_name]
+                ) / self.stds[target_name]
+
+        return normalized.squeeze() if len(target_names) == 1 else normalized
+
+    def denormalize(self, normalized_labels, target_names):
+        """Denormalize labels back to original scale."""
+        if not self.fitted:
+            raise ValueError("Normalizer must be fitted before use")
+
+        if normalized_labels.dim() == 1:
+            normalized_labels = normalized_labels.unsqueeze(-1)
+
+        denormalized = normalized_labels.clone()
+        for i, target_name in enumerate(target_names):
+            target_labels = normalized_labels[:, i]
+            denormalized[:, i] = (
+                target_labels * self.stds[target_name] + self.means[target_name]
+            )
+
+        return denormalized.squeeze() if len(target_names) == 1 else denormalized
+
+
+
+def precompute_and_pool_embeddings_multi_target_normalized(
+    model, dataloader, device, num_targets, normalizer, target_names
 ):
     """
-    Convert a long-format DataFrame to wide format where each target becomes a column.
-    Missing targets for users are filled with NaN.
-
-    Args:
-        df (pd.DataFrame): Input DataFrame in long format
-        user_column (str): Name of the column containing user identifiers
-        target_column (str): Name of the column containing target names
-        value_column (str): Name of the column containing target values
-
-    Returns:
-        pd.DataFrame: Wide-format DataFrame with users as rows and targets as columns
-    """
-
-    # Validate input columns
-    required_columns = [user_column, target_column, value_column]
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    if missing_columns:
-        raise ValueError(f"Missing required columns: {missing_columns}")
-
-    print(f"Converting long format to wide format...")
-    print(
-        f"Input: {len(df)} rows, {df[user_column].nunique()} unique users, {df[target_column].nunique()} unique targets"
-    )
-
-    # Get unique targets and users for reporting
-    unique_targets = sorted(df[target_column].unique())
-    unique_users = sorted(df[user_column].unique())
-
-    print(f"Unique targets: {unique_targets}")
-    print(
-        f"Sample of users: {unique_users[:5]}"
-        + ("..." if len(unique_users) > 5 else "")
-    )
-
-    # Check for duplicate user-target combinations
-    duplicates = df.groupby([user_column, target_column]).size()
-    duplicate_pairs = duplicates[duplicates > 1]
-
-    if len(duplicate_pairs) > 0:
-        print(
-            f"⚠️  Warning: Found {len(duplicate_pairs)} duplicate user-target combinations."
-        )
-        print("Sample duplicates:")
-        for (user, target), count in duplicate_pairs.head().items():
-            print(f"  User {user}, Target {target}: {count} values")
-        print("Using the first occurrence of each duplicate.")
-
-        # Keep only the first occurrence of each user-target combination
-        df = df.drop_duplicates(subset=[user_column, target_column], keep="first")
-
-    # Pivot the DataFrame
-    wide_df = df.pivot(index=user_column, columns=target_column, values=value_column)
-
-    # Reset index to make user_column a regular column again
-    wide_df = wide_df.reset_index()
-
-    # Flatten column names (remove the name from the columns index)
-    wide_df.columns.name = None
-
-    # Report statistics
-    print(f"\nConversion complete:")
-    print(f"Output: {len(wide_df)} users × {len(unique_targets)} targets")
-
-    # Calculate completeness statistics
-    print(f"\nTarget completeness:")
-    for target in unique_targets:
-        if target in wide_df.columns:
-            valid_count = wide_df[target].notna().sum()
-            total_count = len(wide_df)
-            completeness = (valid_count / total_count) * 100
-            print(f"  {target}: {valid_count}/{total_count} ({completeness:.1f}%)")
-
-    # Overall completeness
-    target_columns = [col for col in wide_df.columns if col != user_column]
-    if target_columns:
-        total_values = len(wide_df) * len(target_columns)
-        valid_values = wide_df[target_columns].notna().sum().sum()
-        overall_completeness = (valid_values / total_values) * 100
-        print(
-            f"\nOverall completeness: {valid_values}/{total_values} ({overall_completeness:.1f}%)"
-        )
-
-    return wide_df
-
-
-def precompute_and_pool_embeddings_multi_target(model, dataloader, device, num_targets):
-    """
     Runs the foundation model once to extract embeddings and performs corrected mean pooling.
-    Handles multiple targets simultaneously.
-
-    Args:
-        model: The frozen foundation model.
-        dataloader: The dataloader with triplets, masks, and multi-target labels.
-        device: The device to run computation on ('cuda' or 'cpu').
-        num_targets: Number of target variables.
-
-    Returns:
-        A new DataLoader containing (pooled_embedding, multi_target_labels) pairs.
+    Handles multiple targets simultaneously with label normalization.
     """
     all_pooled_embeddings = []
     all_labels = []
@@ -128,6 +115,8 @@ def precompute_and_pool_embeddings_multi_target(model, dataloader, device, num_t
             padding_mask = padding_mask.to(device)
             labels = labels.to(device)
 
+            normalized_labels = normalizer.normalize(labels, target_names)
+
             # Get embeddings from the foundation model
             embeddings = model(triplets, padding_mask, return_representations=True)[
                 "representations"
@@ -138,59 +127,64 @@ def precompute_and_pool_embeddings_multi_target(model, dataloader, device, num_t
 
             # Count non-padded tokens for each sequence in the batch
             num_non_padded = padding_mask.sum(dim=1).unsqueeze(-1)
-
-            # Avoid division by zero for any sequences that are fully padded
             num_non_padded = torch.clamp(num_non_padded, min=1e-9)
 
             pooled_embeddings = summed_embeddings / num_non_padded
-
             all_pooled_embeddings.append(pooled_embeddings.cpu())
-            all_labels.append(labels.cpu())
+            all_labels.append(normalized_labels.cpu())
 
-    # Create a new, efficient dataset and dataloader
     all_pooled_embeddings = torch.cat(all_pooled_embeddings, dim=0)
     all_labels = torch.cat(all_labels, dim=0)
 
     embedding_dataset = TensorDataset(all_pooled_embeddings, all_labels)
-    # Use a larger batch size for the probe training as it's less memory intensive
     embedding_loader = DataLoader(embedding_dataset, batch_size=256, shuffle=True)
-
     return embedding_loader
 
 
-def evaluate_model_multi_target(
+def evaluate_model_multi_target_normalized(
     model, train_dataloader, val_dataloader, device, target_names
 ):
     """
-    Evaluates the foundation model using linear probes for multiple continuous targets simultaneously.
+    Evaluates the foundation model using linear probes for multiple continuous targets.
+    Uses label normalization and reports MAE on the original scale.
     """
     model.eval()
     num_targets = len(target_names)
 
-    # Step 1: Pre-compute embeddings. This is the only time the large model is used.
+    # Step 1: Fit normalizer on training data
+    print("Fitting label normalizer on training data...")
+    normalizer = LabelNormalizer()
+    all_train_labels = []
+    with torch.no_grad():
+        for batch in tqdm(train_dataloader, desc="Collecting training labels", leave=False):
+            _, _, labels = batch
+            all_train_labels.append(labels)
+    all_train_labels = torch.cat(all_train_labels, dim=0)
+    normalizer.fit(all_train_labels, target_names)
+
+    # Step 2: Pre-compute embeddings with normalized labels
     print("Pre-computing training embeddings...")
-    train_embedding_loader = precompute_and_pool_embeddings_multi_target(
-        model, train_dataloader, device, num_targets
+    train_embedding_loader = precompute_and_pool_embeddings_multi_target_normalized(
+        model, train_dataloader, device, num_targets, normalizer, target_names
     )
     torch.cuda.empty_cache()
+
     print("Pre-computing validation embeddings...")
-    val_embedding_loader = precompute_and_pool_embeddings_multi_target(
-        model, val_dataloader, device, num_targets
+    val_embedding_loader = precompute_and_pool_embeddings_multi_target_normalized(
+        model, val_dataloader, device, num_targets, normalizer, target_names
     )
 
-    # Step 2: Setup and train probes for all targets
+    # Step 3: Setup and train probes
     probes = torch.nn.ModuleList(
         [torch.nn.Linear(model.config.embed_dim, 1) for _ in range(num_targets)]
     ).to(device)
-
     optimizers = [
-        torch.optim.Adam(probe.parameters(), lr=0.01, weight_decay=1e-2)
+        torch.optim.Adam(probe.parameters(), lr=1e-3, weight_decay=1e-2)
         for probe in probes
     ]
-    criterion = torch.nn.L1Loss()  # Mean Absolute Error loss
+    criterion = torch.nn.L1Loss()  # MAE Loss
 
     print(f"Training {num_targets} probes on pre-computed embeddings...")
-
     num_epochs = 50
     for epoch in range(num_epochs):
         total_losses = [0.0] * num_targets
@@ -200,16 +194,17 @@ def evaluate_model_multi_target(
             leave=False,
         )
 
-        for pooled_embeddings, labels in train_pbar:
+        for pooled_embeddings, normalized_labels in train_pbar:
             pooled_embeddings = pooled_embeddings.to(device)
-            labels = labels.to(device)
+            normalized_labels = normalized_labels.to(device)
 
-            # Train each probe
             epoch_losses = []
             for target_idx in range(num_targets):
-                target_labels = labels[:, target_idx] if labels.dim() > 1 else labels
-
-                # Skip if all labels are NaN for this target
+                target_labels = (
+                    normalized_labels[:, target_idx]
+                    if normalized_labels.dim() > 1
+                    else normalized_labels
+                )
                 valid_mask = ~torch.isnan(target_labels)
                 if not valid_mask.any():
                     epoch_losses.append(0.0)
@@ -217,7 +212,6 @@ def evaluate_model_multi_target(
 
                 valid_embeddings = pooled_embeddings[valid_mask]
                 valid_labels = target_labels[valid_mask]
-
                 preds = probes[target_idx](valid_embeddings).squeeze()
                 loss = criterion(preds, valid_labels.float())
 
@@ -229,73 +223,92 @@ def evaluate_model_multi_target(
                 epoch_losses.append(loss.item())
 
             avg_loss = np.mean([l for l in epoch_losses if l > 0])
-            train_pbar.set_postfix({"avg_loss": f"{avg_loss:.4f}"})
+            train_pbar.set_postfix({"avg_mae_loss": f"{avg_loss:.4f}"})
 
-        if epoch % 50 == 0 or epoch == num_epochs - 1:
+        if epoch % 25 == 0 or epoch == num_epochs - 1:
             avg_losses = [
-                total_losses[i] / len(train_embedding_loader)
-                for i in range(num_targets)
+                total_losses[i] / len(train_embedding_loader) for i in range(num_targets)
             ]
             print(
-                f"Epoch {epoch+1}/{num_epochs} completed - Average Losses: {np.mean(avg_losses):.4f}"
+                f"Epoch {epoch+1}/{num_epochs} completed - "
+                f"Average MAE Losses: {np.mean(avg_losses):.4f}"
             )
 
-    # Step 3: Evaluate all probes
+    # Step 4: Evaluate all probes
     print("Evaluating probes...")
     for probe in probes:
         probe.eval()
 
     all_preds = [[] for _ in range(num_targets)]
-    all_labels = [[] for _ in range(num_targets)]
+    all_true_labels = [[] for _ in range(num_targets)]
 
     val_pbar = tqdm(val_embedding_loader, desc="Validation", leave=False)
     with torch.no_grad():
-        for pooled_embeddings, labels in val_pbar:
+        for pooled_embeddings, normalized_labels in val_pbar:
             pooled_embeddings = pooled_embeddings.to(device)
-            labels = labels.cpu()
 
             for target_idx in range(num_targets):
-                preds = probes[target_idx](pooled_embeddings).cpu()
-                target_labels = labels[:, target_idx] if labels.dim() > 1 else labels
+                # Get normalized predictions and denormalize them
+                normalized_preds = probes[target_idx](pooled_embeddings).cpu()
+                if len(target_names) == 1:
+                    denorm_input = normalized_preds
+                else:
+                    denorm_input = torch.zeros(len(normalized_preds), len(target_names))
+                    denorm_input[:, target_idx] = normalized_preds.squeeze()
+                
+                denormalized_preds = normalizer.denormalize(denorm_input, target_names)
+                if len(target_names) > 1:
+                    denormalized_preds = denormalized_preds[:, target_idx]
+                all_preds[target_idx].append(denormalized_preds)
 
-                all_preds[target_idx].append(preds)
-                all_labels[target_idx].append(target_labels)
+                # Denormalize true labels for evaluation
+                normalized_target_labels = (
+                    normalized_labels[:, target_idx]
+                    if normalized_labels.dim() > 1
+                    else normalized_labels
+                )
+                if len(target_names) == 1:
+                    denorm_labels_input = normalized_target_labels
+                else:
+                    denorm_labels_input = torch.zeros(len(normalized_target_labels), len(target_names))
+                    denorm_labels_input[:, target_idx] = normalized_target_labels
+                
+                denormalized_true_labels = normalizer.denormalize(denorm_labels_input, target_names)
+                if len(target_names) > 1:
+                    denormalized_true_labels = denormalized_true_labels[:, target_idx]
+                all_true_labels[target_idx].append(denormalized_true_labels)
+
 
     # Calculate metrics for each target
     results = {}
     for target_idx, target_name in enumerate(target_names):
         preds = torch.cat(all_preds[target_idx], dim=0).numpy()
-        labels = torch.cat(all_labels[target_idx], dim=0).numpy()
+        labels = torch.cat(all_true_labels[target_idx], dim=0).numpy()
 
-        # Remove NaN values
         valid_mask = ~np.isnan(labels)
-        if valid_mask.sum() == 0:
-            results[target_name] = {"r2": None, "mae": None}
+        if valid_mask.sum() == 0 or np.var(labels[valid_mask]) == 0:
+            results[target_name] = {"mae": None}
             continue
 
         valid_preds = preds[valid_mask]
         valid_labels = labels[valid_mask]
-
-        # Check if we have variation in labels
-        if np.var(valid_labels) == 0:
-            results[target_name] = {"r2": None, "mae": None}
-            continue
-
+        
         try:
-            r2 = r2_score(valid_labels, valid_preds)
             mae = mean_absolute_error(valid_labels, valid_preds)
-            results[target_name] = {"r2": r2, "mae": mae}
+            results[target_name] = {"mae": mae}
         except Exception as e:
             print(f"Error calculating metrics for {target_name}: {e}")
-            results[target_name] = {"r2": None, "mae": None}
+            results[target_name] = {"mae": None}
 
     return results
 
 
-def precompute_mean_pooled_features_multi_target(dataloader, device, num_targets):
+def precompute_mean_pooled_features_multi_target_normalized(
+    dataloader, device, num_targets, normalizer, target_names
+):
     """
     Creates baseline features by performing masked mean-pooling directly on input variables.
-    Handles multiple targets.
+    Handles multiple targets with normalized labels.
     """
     all_pooled_features = []
     all_labels = []
@@ -304,27 +317,24 @@ def precompute_mean_pooled_features_multi_target(dataloader, device, num_targets
         pbar = tqdm(dataloader, desc="Extracting Mean-Pooled Features", leave=False)
         for batch in pbar:
             features, padding_mask, labels = batch
-            features = features.to(device)
-            padding_mask = padding_mask.to(device)
-            labels = labels.to(device)
+            features, padding_mask, labels = (
+                features.to(device),
+                padding_mask.to(device),
+                labels.to(device),
+            )
 
-            # --- Masked Mean Pooling on Input Features ---
-            # For triplets, we use the value (3rd column) as features
+            normalized_labels = normalizer.normalize(labels, target_names)
+
             if features.dim() == 3 and features.shape[-1] == 3:
-                # Extract values from triplets and create feature matrix
-                values = features[:, :, 2]  # Take the value column
-                var_ids = features[:, :, 1].long()  # Variable IDs
-
-                # Create one-hot encoding for variables
+                # Handle triplet format: (time, var_id, value)
+                values = features[:, :, 2]
+                var_ids = features[:, :, 1].long()
                 batch_size, seq_len = values.shape
-                max_var_id = 63
+                max_var_id = 63 # Assuming max_var_id is known
 
-                # Create feature matrix: [batch, seq_len, num_variables]
                 feature_matrix = torch.zeros(
                     batch_size, seq_len, max_var_id, device=device
                 )
-
-                # Fill in values for each variable
                 batch_indices = (
                     torch.arange(batch_size).unsqueeze(1).expand(-1, seq_len).to(device)
                 )
@@ -332,105 +342,107 @@ def precompute_mean_pooled_features_multi_target(dataloader, device, num_targets
                     torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1).to(device)
                 )
 
-                # Only set values where padding mask is true
                 valid_mask = padding_mask.bool()
                 feature_matrix[
                     batch_indices[valid_mask],
                     seq_indices[valid_mask],
                     var_ids[valid_mask],
                 ] = values[valid_mask]
-
-                # Apply mean pooling
+                
                 masked_features = feature_matrix * padding_mask.unsqueeze(-1)
                 summed_features = torch.sum(masked_features, dim=1)
-
-                num_non_padded = padding_mask.sum(dim=1).unsqueeze(-1)
-                num_non_padded = torch.clamp(num_non_padded, min=1e-9)
-
-                pooled_features = summed_features / num_non_padded
+                
             else:
                 # Standard feature matrix
                 masked_features = features * padding_mask.unsqueeze(-1)
                 summed_features = torch.sum(masked_features, dim=1)
 
-                num_non_padded = padding_mask.sum(dim=1).unsqueeze(-1)
-                num_non_padded = torch.clamp(num_non_padded, min=1e-9)
-
-                pooled_features = summed_features / num_non_padded
+            num_non_padded = padding_mask.sum(dim=1).unsqueeze(-1)
+            num_non_padded = torch.clamp(num_non_padded, min=1e-9)
+            pooled_features = summed_features / num_non_padded
 
             all_pooled_features.append(pooled_features.cpu())
-            all_labels.append(labels.cpu())
+            all_labels.append(normalized_labels.cpu())
 
     all_pooled_features = torch.cat(all_pooled_features, dim=0)
     all_labels = torch.cat(all_labels, dim=0)
 
     feature_dataset = TensorDataset(all_pooled_features, all_labels)
-    feature_loader = DataLoader(feature_dataset, batch_size=256, shuffle=True)
-
+    feature_loader = DataLoader(feature_dataset, batch_size=512, shuffle=True)
     return feature_loader, all_pooled_features.shape[1]
 
 
-def evaluate_mean_pooling_baseline_multi_target(
+def evaluate_mean_pooling_baseline_multi_target_normalized(
     train_dataloader, val_dataloader, device, target_names
 ):
     """
-    Evaluates baseline using mean-pooled features for multiple continuous targets simultaneously.
+    Evaluates a baseline using mean-pooled features for multiple continuous targets.
     """
     num_targets = len(target_names)
 
-    # Step 1: Pre-compute the simple mean-pooled features.
+    # Step 1: Fit normalizer
+    print("Fitting baseline label normalizer on training data...")
+    normalizer = LabelNormalizer()
+    all_train_labels = []
+    with torch.no_grad():
+        for batch in tqdm(
+            train_dataloader, desc="Collecting baseline training labels", leave=False
+        ):
+            _, _, labels = batch
+            all_train_labels.append(labels)
+    all_train_labels = torch.cat(all_train_labels, dim=0)
+    normalizer.fit(all_train_labels, target_names)
+
+    # Step 2: Pre-compute mean-pooled features
     print("Pre-computing baseline training features...")
-    train_feature_loader, num_features = precompute_mean_pooled_features_multi_target(
-        train_dataloader, device, num_targets
+    train_feature_loader, num_features = (
+        precompute_mean_pooled_features_multi_target_normalized(
+            train_dataloader, device, num_targets, normalizer, target_names
+        )
     )
-
     print("Pre-computing baseline validation features...")
-    val_feature_loader, _ = precompute_mean_pooled_features_multi_target(
-        val_dataloader, device, num_targets
+    val_feature_loader, _ = precompute_mean_pooled_features_multi_target_normalized(
+        val_dataloader, device, num_targets, normalizer, target_names
     )
 
-    # Step 2: Setup and train probes for all targets
+    # Step 3: Setup and train probes
     probes = torch.nn.ModuleList(
         [torch.nn.Linear(num_features, 1) for _ in range(num_targets)]
     ).to(device)
-
     optimizers = [
-        torch.optim.Adam(probe.parameters(), lr=0.001, weight_decay=1e-2)
+        torch.optim.Adam(probe.parameters(), lr=1e-3, weight_decay=1e-2)
         for probe in probes
     ]
-    criterion = torch.nn.L1Loss()  # Mean Absolute Error loss
+    criterion = torch.nn.L1Loss()  # MAE Loss
 
     print(
-        f"Training {num_targets} baseline probes on {num_features}-dimensional mean-pooled features..."
+        f"Training {num_targets} baseline probes on "
+        f"{num_features}-dimensional mean-pooled features..."
     )
-
-    num_epochs = 50
+    num_epochs = 100
     for epoch in range(num_epochs):
-        total_losses = [0.0] * num_targets
         train_pbar = tqdm(
             train_feature_loader,
             desc=f"Training Epoch {epoch+1}/{num_epochs}",
             leave=False,
         )
-
-        for features, labels in train_pbar:
-            features = features.to(device)
-            labels = labels.to(device)
-
-            # Train each probe
-            epoch_losses = []
+        for features, normalized_labels in train_pbar:
+            features, normalized_labels = features.to(device), normalized_labels.to(device)
+            
+            # This loop structure is similar to the main evaluation function
+            # and could be refactored into a helper if desired.
             for target_idx in range(num_targets):
-                target_labels = labels[:, target_idx] if labels.dim() > 1 else labels
-
-                # Skip if all labels are NaN for this target
+                target_labels = (
+                    normalized_labels[:, target_idx]
+                    if normalized_labels.dim() > 1
+                    else normalized_labels
+                )
                 valid_mask = ~torch.isnan(target_labels)
                 if not valid_mask.any():
-                    epoch_losses.append(0.0)
                     continue
 
                 valid_features = features[valid_mask]
                 valid_labels = target_labels[valid_mask]
-
                 preds = probes[target_idx](valid_features).squeeze()
                 loss = criterion(preds, valid_labels.float())
 
@@ -438,98 +450,72 @@ def evaluate_mean_pooling_baseline_multi_target(
                 loss.backward()
                 optimizers[target_idx].step()
 
-                total_losses[target_idx] += loss.item()
-                epoch_losses.append(loss.item())
-
-            avg_loss = np.mean([l for l in epoch_losses if l > 0])
-            train_pbar.set_postfix({"avg_loss": f"{avg_loss:.4f}"})
-
-        if epoch % 25 == 0 or epoch == num_epochs - 1:
-            avg_losses = [
-                total_losses[i] / len(train_feature_loader) for i in range(num_targets)
-            ]
-            print(
-                f"Epoch {epoch+1}/{num_epochs} completed - Average Losses: {np.mean(avg_losses):.4f}"
-            )
-
-    # Step 3: Evaluate all probes
     print("Evaluating baseline probes...")
+    
     for probe in probes:
         probe.eval()
-
+    
     all_preds = [[] for _ in range(num_targets)]
-    all_labels = [[] for _ in range(num_targets)]
-
-    val_pbar = tqdm(val_feature_loader, desc="Validation", leave=False)
+    all_true_labels = [[] for _ in range(num_targets)]
+    
     with torch.no_grad():
-        for features, labels in val_pbar:
+        for features, normalized_labels in val_feature_loader:
             features = features.to(device)
-            labels = labels.cpu()
-
             for target_idx in range(num_targets):
-                preds = probes[target_idx](features).cpu()
-                target_labels = labels[:, target_idx] if labels.dim() > 1 else labels
+                normalized_preds = probes[target_idx](features).cpu()
+                if len(target_names) == 1:
+                    denorm_input = normalized_preds
+                else:
+                    denorm_input = torch.zeros(len(normalized_preds), len(target_names))
+                    denorm_input[:, target_idx] = normalized_preds.squeeze()
 
-                all_preds[target_idx].append(preds)
-                all_labels[target_idx].append(target_labels)
+                denormalized_preds = normalizer.denormalize(denorm_input, target_names)
+                if len(target_names) > 1:
+                    denormalized_preds = denormalized_preds[:, target_idx]
+                all_preds[target_idx].append(denormalized_preds)
 
-    # Calculate metrics for each target
+                normalized_target_labels = (
+                    normalized_labels[:, target_idx]
+                    if normalized_labels.dim() > 1
+                    else normalized_labels
+                )
+                if len(target_names) == 1:
+                    denorm_labels_input = normalized_target_labels
+                else:
+                    denorm_labels_input = torch.zeros(len(normalized_target_labels), len(target_names))
+                    denorm_labels_input[:, target_idx] = normalized_target_labels
+                
+                denormalized_true_labels = normalizer.denormalize(denorm_labels_input, target_names)
+                if len(target_names) > 1:
+                    denormalized_true_labels = denormalized_true_labels[:, target_idx]
+                all_true_labels[target_idx].append(denormalized_true_labels)
+
+
+    # Calculate final metrics
     results = {}
     for target_idx, target_name in enumerate(target_names):
         preds = torch.cat(all_preds[target_idx], dim=0).numpy()
-        labels = torch.cat(all_labels[target_idx], dim=0).numpy()
-
-        # Remove NaN values
+        labels = torch.cat(all_true_labels[target_idx], dim=0).numpy()
         valid_mask = ~np.isnan(labels)
-        if valid_mask.sum() == 0:
-            results[target_name] = {"r2": None, "mae": None}
-            continue
-
-        valid_preds = preds[valid_mask]
-        valid_labels = labels[valid_mask]
-
-        # Check if we have variation in labels
-        if np.var(valid_labels) == 0:
-            results[target_name] = {"r2": None, "mae": None}
-            continue
-
-        try:
-            r2 = r2_score(valid_labels, valid_preds)
-            mae = mean_absolute_error(valid_labels, valid_preds)
-            results[target_name] = {"r2": r2, "mae": mae}
-        except Exception as e:
-            print(f"Error calculating baseline metrics for {target_name}: {e}")
-            results[target_name] = {"r2": None, "mae": None}
-
+        if valid_mask.sum() > 0 and np.var(labels[valid_mask]) > 0:
+            mae = mean_absolute_error(labels[valid_mask], preds[valid_mask])
+            results[target_name] = {"mae": mae}
+        else:
+            results[target_name] = {"mae": None}
+    
     return results
 
 
 def calculate_target_statistics(dataset, target_names):
-    """
-    Calculate statistics for continuous target values in training and validation sets.
-
-    Args:
-        dataset: The dataset with splits information
-        target_names: List of target column names
-
-    Returns:
-        Dictionary with train and val statistics for each target
-    """
+    """Calculate statistics for continuous target values in training and validation sets."""
     train_indices = dataset.splits["train"]
     val_indices = dataset.splits["val"]
-
-    # Get the continuous labels for all targets from the dataset's y attribute
     all_labels = torch.tensor(dataset.y, dtype=torch.float32)
 
-    train_stats = {}
-    val_stats = {}
+    train_stats, val_stats = {}, {}
 
     for i, target_name in enumerate(target_names):
-        # Get labels for this target
-        if all_labels.dim() > 1:
-            target_labels = all_labels[:, i]
-        else:
-            target_labels = all_labels
+        target_labels = all_labels[:, i] if all_labels.dim() > 1 else all_labels
 
         # Calculate for training set
         train_labels = target_labels[train_indices]
@@ -544,13 +530,7 @@ def calculate_target_statistics(dataset, target_names):
                 "count": train_valid_mask.sum().item(),
             }
         else:
-            train_stats[target_name] = {
-                "mean": None,
-                "std": None,
-                "min": None,
-                "max": None,
-                "count": 0,
-            }
+            train_stats[target_name] = {"mean": None, "std": None, "min": None, "max": None, "count": 0}
 
         # Calculate for validation set
         val_labels = target_labels[val_indices]
@@ -565,28 +545,23 @@ def calculate_target_statistics(dataset, target_names):
                 "count": val_valid_mask.sum().item(),
             }
         else:
-            val_stats[target_name] = {
-                "mean": None,
-                "std": None,
-                "min": None,
-                "max": None,
-                "count": 0,
-            }
+            val_stats[target_name] = {"mean": None, "std": None, "min": None, "max": None, "count": 0}
 
     return train_stats, val_stats
 
 
-def create_multi_target_dataloader(args, df, continuous_df, target_columns):
+def create_multi_target_dataloader(args, df, biomarker_df, target_columns):
     """Create dataloaders for multiple continuous targets simultaneously."""
     dataset = EmpiricalDatasetIMTS(
         args,
         df=df,
         timeseries_columns=args.timeseries_columns,
         is_pretrain=(args.pretrain == 1),
-        target_columns=target_columns,  # Pass list of targets
-        target_df=continuous_df,  # Use target_df instead of binary_df
+        target_columns=target_columns,
+        binary_df=biomarker_df,
         min_obs_per_user=args.min_seq_len,
         max_seq_len=args.max_seq_len,
+        # outlier_method="zscore",
         load_from_cache=False,
     )
 
@@ -614,219 +589,113 @@ def create_multi_target_dataloader(args, df, continuous_df, target_columns):
 
 
 if __name__ == "__main__":
-    args = IMTSConfig()
-    args.biomarker_data_path = "biomarker.csv"
-    args.pretrain = 0
-    # MAE CKPT PARAMS
-    # args.load_ckpt_path = "checkpoints/MAE_model_best.pt"
-    # args.batch_size = 4
-    # args.num_layers = 8
-    # args.predictor_layers = 4
 
+    args = IMTSConfig() # this should have the data and checkpoint paths and not be in pretraining mode 
+    biomarker_df = pd.read_parquet(args.biomarker_data_path)
     ckpt = torch.load(args.load_ckpt_path)
     model = IMTS(args)
-    # model = MaskedAutoencoder(args)
     model.load_state_dict(ckpt)
     model.to("cuda")
 
-    df = pd.read_parquet(args.data_path)
-    continuous_df = pd.read_parquet(
-        args.biomarker_data_path
-    )  # Changed to continuous data
+    df = pd.read_csv(args.data_path)
+    all_targets = args.target_columns
 
-    # Define continuous target columns - these should be your continuous variables
-    all_targets = [
-        "sleep_score",
-        "activity_level",
-        "heart_rate_variability",
-        "stress_level",
-        "recovery_score",
-    ]
+    available_targets = [t for t in all_targets if t in biomarker_df.columns]
 
-    # Filter targets that actually exist in continuous_df
-    available_targets = [
-        target for target in all_targets if target in continuous_df.columns
-    ]
-    missing_targets = [
-        target for target in all_targets if target not in continuous_df.columns
-    ]
-
-    if missing_targets:
-        print(
-            f"⚠️  Warning: The following targets are not available in continuous_df: {missing_targets}"
-        )
-
-    print(
-        f"📊 Evaluating {len(available_targets)} available continuous target variables simultaneously..."
-    )
-    print(
-        "Available targets:",
-        available_targets[:5],
-        "..." if len(available_targets) > 5 else "",
-    )
-    print("=" * 80)
-
-    # Create output directory
     output_dir = "evaluation_results"
     os.makedirs(output_dir, exist_ok=True)
 
     try:
-        # Create multi-target dataloaders
         print("Creating multi-target dataloaders...")
         train_loader, val_loader, dataset = create_multi_target_dataloader(
-            args, df, continuous_df, available_targets
+            args, df, biomarker_df, available_targets
         )
 
-        target_info = dataset.get_target_info()
         print(
-            f"Dataset info: {target_info['num_targets']} targets, {len(dataset)} samples"
+            f"Dataset info: {dataset.get_target_info()['num_targets']} targets, "
+            f"{len(dataset)} samples"
         )
         print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-        # Calculate target statistics
         train_stats, val_stats = calculate_target_statistics(dataset, available_targets)
-        print("\nTarget Value Statistics:")
-        for target in available_targets:
-            train_stat = train_stats[target]
-            val_stat = val_stats[target]
-            print(f"  {target}:")
-            print(
-                f"    Train: mean={train_stat['mean']:.4f}, std={train_stat['std']:.4f}, range=[{train_stat['min']:.4f}, {train_stat['max']:.4f}]"
-            )
-            print(
-                f"    Val:   mean={val_stat['mean']:.4f}, std={val_stat['std']:.4f}, range=[{val_stat['min']:.4f}, {val_stat['max']:.4f}]"
-            )
-
-        # Evaluate baseline for all targets
-        print(f"\n📊 Evaluating baseline for all {len(available_targets)} targets...")
-        baseline_results = evaluate_mean_pooling_baseline_multi_target(
+        print("\nTarget Value Statistics (Train Set):")
+        
+        # Evaluate baseline
+        print(f"\nEvaluating baseline for {len(available_targets)} targets...")
+        baseline_results = evaluate_mean_pooling_baseline_multi_target_normalized(
             train_loader, val_loader, "cuda", available_targets
         )
 
-        # Evaluate model for all targets
-        print(f"\n🧠 Evaluating model for all {len(available_targets)} targets...")
-        model_results = evaluate_model_multi_target(
+        # Evaluate model
+        print(f"\nEvaluating model for {len(available_targets)} targets...")
+        model_results = evaluate_model_multi_target_normalized(
             model, train_loader, val_loader, "cuda", available_targets
         )
 
-        # Compile results
+        # Compile and save results
         results = []
         for target in available_targets:
-            baseline = baseline_results.get(target, {"r2": None, "mae": None})
-            model = model_results.get(target, {"r2": None, "mae": None})
+            baseline_mae = baseline_results.get(target, {}).get('mae')
+            model_mae = model_results.get(target, {}).get('mae')
+            
+            improvement = None
+            if model_mae is not None and baseline_mae is not None:
+                improvement = baseline_mae - model_mae
 
-            baseline_r2 = baseline["r2"]
-            baseline_mae = baseline["mae"]
-            model_r2 = model["r2"]
-            model_mae = model["mae"]
-
-            train_stat = train_stats[target]
-            val_stat = val_stats[target]
-
-            results.append(
-                {
-                    "target_variable": target,
-                    "baseline_r2": baseline_r2,
-                    "baseline_mae": baseline_mae,
-                    "model_r2": model_r2,
-                    "model_mae": model_mae,
-                    "r2_improvement": (
-                        model_r2 - baseline_r2
-                        if (model_r2 is not None and baseline_r2 is not None)
-                        else None
-                    ),
-                    "mae_improvement": (
-                        baseline_mae - model_mae
-                        if (model_mae is not None and baseline_mae is not None)
-                        else None
-                    ),  # Negative improvement is better for MAE
-                    "train_mean": train_stat["mean"],
-                    "train_std": train_stat["std"],
-                    "val_mean": val_stat["mean"],
-                    "val_std": val_stat["std"],
-                }
-            )
-
-        # Save results
-        print("\n" + "=" * 80)
-        print("💾 Saving results...")
+            results.append({
+                "target_variable": target,
+                "baseline_mae": baseline_mae,
+                "model_mae": model_mae,
+                "mae_improvement": improvement,
+                "train_mean": train_stats[target]["mean"],
+                "train_std": train_stats[target]["std"],
+            })
 
         results_df = pd.DataFrame(results)
-
-        # Create filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         final_filename = os.path.join(
-            output_dir, f"multi_target_continuous_evaluation_{timestamp}.csv"
+            output_dir, f"multi_target_continuous_evaluation_mae_{timestamp}.csv"
         )
         results_df.to_csv(final_filename, index=False)
-
+        print("\n" + "=" * 80)
         print(f"Results saved to: {final_filename}")
 
-        # Display summary statistics
-        print("\n📈 Summary Statistics:")
-        print("-" * 40)
-
-        # Filter out None values for statistics
-        valid_results = results_df.dropna(subset=["baseline_r2", "model_r2"])
-
-        if len(valid_results) > 0:
-            print(
-                f"Successfully evaluated: {len(valid_results)}/{len(available_targets)} variables"
-            )
-            print(f"Average baseline R²: {valid_results['baseline_r2'].mean():.4f}")
-            print(f"Average model R²: {valid_results['model_r2'].mean():.4f}")
-            print(
-                f"Average R² improvement: {valid_results['r2_improvement'].mean():.4f}"
-            )
+        # Display summary
+        print("\nSummary Statistics:")
+        print("-" * 50)
+        valid_results = results_df.dropna(subset=["baseline_mae", "model_mae"])
+        if not valid_results.empty:
+            print(f"Evaluated: {len(valid_results)}/{len(available_targets)} variables")
             print(f"Average baseline MAE: {valid_results['baseline_mae'].mean():.4f}")
-            print(f"Average model MAE: {valid_results['model_mae'].mean():.4f}")
-            print(
-                f"Average MAE improvement: {valid_results['mae_improvement'].mean():.4f}"
-            )
-
-            print(f"\nTop 5 variables with largest R² improvements:")
-            top_r2 = valid_results.nlargest(5, "r2_improvement")[
-                ["target_variable", "r2_improvement", "train_mean", "val_mean"]
-            ]
-            for _, row in top_r2.iterrows():
+            print(f"Average model MAE:    {valid_results['model_mae'].mean():.4f}")
+            print(f"Average MAE improvement: {valid_results['mae_improvement'].mean():.4f}")
+            
+            print("\nTop 5 improvements:")
+            top_5 = valid_results.nlargest(5, "mae_improvement")
+            for _, row in top_5.iterrows():
                 print(
-                    f"  {row['target_variable']}: +{row['r2_improvement']:.4f} (Train mean: {row['train_mean']:.2f}, Val mean: {row['val_mean']:.2f})"
-                )
-
-            print(f"\nTop 5 variables with largest MAE improvements:")
-            top_mae = valid_results.nlargest(5, "mae_improvement")[
-                ["target_variable", "mae_improvement", "train_std", "val_std"]
-            ]
-            for _, row in top_mae.iterrows():
-                print(
-                    f"  {row['target_variable']}: +{row['mae_improvement']:.4f} (Train std: {row['train_std']:.2f}, Val std: {row['val_std']:.2f})"
+                    f"  {row['target_variable']}: +{row['mae_improvement']:.4f} "
+                    f"(model MAE: {row['model_mae']:.4f})"
                 )
         else:
-            print("No valid results obtained.")
-
-        print(
-            f"\n🎉 Multi-target continuous evaluation complete! Results saved to {final_filename}"
-        )
+            print("No valid results were obtained.")
+        
+        print(f"\n🎉 Evaluation complete!")
 
     except Exception as e:
-        print(f"❌ Critical error during evaluation: {str(e)}")
         import traceback
-
+        print(f"❌ Critical error during evaluation: {str(e)}")
         traceback.print_exc()
 
         # Save error info
         error_info = {
             "error": str(e),
+            "traceback": traceback.format_exc(),
             "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
-            "available_targets": available_targets,
         }
-
         error_filename = os.path.join(
-            output_dir,
-            f"evaluation_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            output_dir, f"evaluation_error_{error_info['timestamp']}.txt"
         )
         with open(error_filename, "w") as f:
-            f.write(f"Error: {error_info}\n")
-            f.write(f"Traceback:\n{traceback.format_exc()}")
-
+            f.write(str(error_info))
         print(f"Error details saved to: {error_filename}")
