@@ -1,8 +1,9 @@
 # JETS: Joint Embedding Foundation Model for Behavioral Time Series
 
-Create the python virtual environment with the following commands
+Create the python virtual environment with the following commands (linux environment with GPU required)
 ```
 conda create -n jets python=3.9
+conda activate jets
 pip install -r requirements.txt
 ```
 
