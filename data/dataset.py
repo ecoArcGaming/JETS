@@ -6,7 +6,7 @@ import pandas as pd
 import pickle
 import gc
 
-class EmpiricalDatasetIMTS(Dataset):
+class EHDatasetIMTS(Dataset):
     """
     Dataset for IMTS model that outputs triplets (time, variable_id, value).
     Supports chunking long sequences and multiple target columns.

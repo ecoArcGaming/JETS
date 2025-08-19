@@ -1,6 +1,6 @@
 from JETS import *
 from data.config import IMTSConfig
-from data.dataset import collate_triplets, EmpiricalDatasetIMTS
+from data.dataset import collate_triplets, EHDatasetIMTS
 from sklearn.metrics import roc_auc_score, average_precision_score
 import torch
 from tqdm import tqdm
@@ -480,7 +480,7 @@ def calculate_positive_sample_percentages(dataset, target_names):
 
 def create_multi_target_dataloader(args, df, binary_df, target_columns):
     """Create dataloaders for multiple targets simultaneously."""
-    dataset = EmpiricalDatasetIMTS(
+    dataset = EHDatasetIMTS(
         args,
         df=df,
         timeseries_columns=args.timeseries_columns,

@@ -5,7 +5,7 @@ from JETS import *
 import pandas as pd
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from data.config import IMTSConfig
-from data.dataset import collate_triplets, EmpiricalDatasetIMTS
+from data.dataset import collate_triplets, EHDatasetIMTS
 import wandb
 from trainer import IMTSTrainer
 
@@ -158,7 +158,7 @@ if __name__ == "__main__":
     binary_df = pd.read_parquet(args.binary_data_path)
     target_column = args.target_column
 
-    dataset = EmpiricalDatasetIMTS(
+    dataset = EHDatasetIMTS(
         args,
         df=df,
         timeseries_columns=args.timeseries_columns,

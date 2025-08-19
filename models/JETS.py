@@ -21,7 +21,7 @@ class TimeEmbedding(nn.Module):
         self.time_proj = nn.Linear(embed_dim, embed_dim)
         
     def forward(self, times: torch.Tensor) -> torch.Tensor:
-        # time is already normalized in EmpiricalDataset, should be a flat tensor, shape [total_time]
+        # time is already normalized in EHDataset, should be a flat tensor, shape [total_time]
         normalized_times = times
         
         # Create sinusoidal embeddings

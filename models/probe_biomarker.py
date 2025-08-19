@@ -9,7 +9,7 @@ from tqdm import tqdm
 from MAE import MaskedAutoencoder
 from JETS import *
 from data.config import IMTSConfig
-from data.dataset import collate_triplets, EmpiricalDatasetIMTS
+from data.dataset import collate_triplets, EHDatasetIMTS
 
 
 class LabelNormalizer:
@@ -552,7 +552,7 @@ def calculate_target_statistics(dataset, target_names):
 
 def create_multi_target_dataloader(args, df, biomarker_df, target_columns):
     """Create dataloaders for multiple continuous targets simultaneously."""
-    dataset = EmpiricalDatasetIMTS(
+    dataset = EHDatasetIMTS(
         args,
         df=df,
         timeseries_columns=args.timeseries_columns,
